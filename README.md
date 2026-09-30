@@ -21,8 +21,25 @@ CSV / TXT の測定データをブラウザ上で読み込み、背景補正・�
 ```
 .
 ├── app.py              # Streamlit UI および解析・グラフ描画ロジック
+├── xps_database.json   # 元素・軌道の BE / 探索ウィンドウ / 配色（外部DB）
 ├── requirements.txt    # 依存パッケージ
 └── README.md           # 本ドキュメント
+```
+
+### 元素・軌道の追加方法
+
+`xps_database.json` の `orbitals` 配列にエントリを追加するだけで、軌道アサインと Plotly 配色に反映されます（`app.py` の書き換え不要）。
+
+```json
+{
+  "name": "Cr 2p",
+  "element": "Cr",
+  "orbital": "2p",
+  "binding_energy_ev": 574.0,
+  "search_window_ev": { "min": 570.0, "max": 590.0 },
+  "color": "#E69F00",
+  "category": "MXene/MAX"
+}
 ```
 
 ## ローカルでの実行手順

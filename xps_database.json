@@ -1,0 +1,292 @@
+{
+  "version": 1,
+  "description": "XPS 元素・軌道の参照データベース（MXene / MAX 層関連を中心）。新しい元素を追加する場合は orbitals 配列にオブジェクトを追記するだけで、アプリの軌道アサインと配色に自動反映されます。",
+  "palette": {
+    "orange": "#E69F00",
+    "sky_blue": "#56B4E9",
+    "bluish_green": "#009E73",
+    "yellow": "#F0E442",
+    "blue": "#0072B2",
+    "vermillion": "#D55E00",
+    "reddish_purple": "#CC79A7",
+    "black": "#000000",
+    "gray": "#999999"
+  },
+  "role_colors": {
+    "raw": "#000000",
+    "background": "#999999",
+    "corrected": "#0072B2",
+    "fit_sum": "#D55E00",
+    "peak_marker": "#E69F00"
+  },
+  "fallback_palette": [
+    "#E69F00",
+    "#56B4E9",
+    "#009E73",
+    "#F0E442",
+    "#0072B2",
+    "#D55E00",
+    "#CC79A7"
+  ],
+  "default_assign_tolerance_ev": 5.0,
+  "unknown": {
+    "name": "Unknown",
+    "color": "#999999"
+  },
+  "orbitals": [
+    {
+      "name": "C 1s",
+      "element": "C",
+      "orbital": "1s",
+      "binding_energy_ev": 284.8,
+      "search_window_ev": { "min": 280.0, "max": 290.0 },
+      "color": "#E69F00",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "O 1s",
+      "element": "O",
+      "orbital": "1s",
+      "binding_energy_ev": 531.0,
+      "search_window_ev": { "min": 525.0, "max": 540.0 },
+      "color": "#56B4E9",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "F 1s",
+      "element": "F",
+      "orbital": "1s",
+      "binding_energy_ev": 685.0,
+      "search_window_ev": { "min": 680.0, "max": 695.0 },
+      "color": "#009E73",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Cl 2p",
+      "element": "Cl",
+      "orbital": "2p",
+      "binding_energy_ev": 199.0,
+      "search_window_ev": { "min": 195.0, "max": 205.0 },
+      "color": "#F0E442",
+      "category": "MXene/MAX",
+      "note": "MXene の Cl 終端で一般的に測定される軌道"
+    },
+    {
+      "name": "Cl 1s",
+      "element": "Cl",
+      "orbital": "1s",
+      "binding_energy_ev": 2823.0,
+      "search_window_ev": { "min": 2810.0, "max": 2835.0 },
+      "color": "#F0E442",
+      "category": "MXene/MAX",
+      "note": "硬X線 XPS 向け。通常の Al/Mg Kα 線源では励起が困難なため、ラボ XPS では Cl 2p を使用"
+    },
+    {
+      "name": "Ti 2p",
+      "element": "Ti",
+      "orbital": "2p",
+      "binding_energy_ev": 455.0,
+      "search_window_ev": { "min": 450.0, "max": 470.0 },
+      "color": "#0072B2",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Ti 2p3/2",
+      "element": "Ti",
+      "orbital": "2p3/2",
+      "binding_energy_ev": 454.0,
+      "search_window_ev": { "min": 451.0, "max": 458.0 },
+      "color": "#0072B2",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Ti 2p1/2",
+      "element": "Ti",
+      "orbital": "2p1/2",
+      "binding_energy_ev": 460.0,
+      "search_window_ev": { "min": 457.0, "max": 465.0 },
+      "color": "#56B4E9",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Nb 3d",
+      "element": "Nb",
+      "orbital": "3d",
+      "binding_energy_ev": 203.5,
+      "search_window_ev": { "min": 200.0, "max": 212.0 },
+      "color": "#D55E00",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Nb 3d5/2",
+      "element": "Nb",
+      "orbital": "3d5/2",
+      "binding_energy_ev": 202.0,
+      "search_window_ev": { "min": 200.0, "max": 206.0 },
+      "color": "#D55E00",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Nb 3d3/2",
+      "element": "Nb",
+      "orbital": "3d3/2",
+      "binding_energy_ev": 205.0,
+      "search_window_ev": { "min": 203.0, "max": 210.0 },
+      "color": "#E69F00",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "V 2p",
+      "element": "V",
+      "orbital": "2p",
+      "binding_energy_ev": 516.0,
+      "search_window_ev": { "min": 510.0, "max": 525.0 },
+      "color": "#CC79A7",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "V 2p3/2",
+      "element": "V",
+      "orbital": "2p3/2",
+      "binding_energy_ev": 512.0,
+      "search_window_ev": { "min": 510.0, "max": 518.0 },
+      "color": "#CC79A7",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "V 2p1/2",
+      "element": "V",
+      "orbital": "2p1/2",
+      "binding_energy_ev": 520.0,
+      "search_window_ev": { "min": 516.0, "max": 525.0 },
+      "color": "#009E73",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Mo 3d",
+      "element": "Mo",
+      "orbital": "3d",
+      "binding_energy_ev": 229.5,
+      "search_window_ev": { "min": 225.0, "max": 236.0 },
+      "color": "#000000",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Mo 3d5/2",
+      "element": "Mo",
+      "orbital": "3d5/2",
+      "binding_energy_ev": 228.0,
+      "search_window_ev": { "min": 225.0, "max": 232.0 },
+      "color": "#000000",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Mo 3d3/2",
+      "element": "Mo",
+      "orbital": "3d3/2",
+      "binding_energy_ev": 231.0,
+      "search_window_ev": { "min": 228.0, "max": 236.0 },
+      "color": "#999999",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "Al 2p",
+      "element": "Al",
+      "orbital": "2p",
+      "binding_energy_ev": 73.0,
+      "search_window_ev": { "min": 70.0, "max": 78.0 },
+      "color": "#999999",
+      "category": "MXene/MAX"
+    },
+    {
+      "name": "N 1s",
+      "element": "N",
+      "orbital": "1s",
+      "binding_energy_ev": 400.0,
+      "search_window_ev": { "min": 395.0, "max": 405.0 },
+      "color": "#56B4E9",
+      "category": "general"
+    },
+    {
+      "name": "Si 2p",
+      "element": "Si",
+      "orbital": "2p",
+      "binding_energy_ev": 99.0,
+      "search_window_ev": { "min": 96.0, "max": 105.0 },
+      "color": "#009E73",
+      "category": "general"
+    },
+    {
+      "name": "Si 2s",
+      "element": "Si",
+      "orbital": "2s",
+      "binding_energy_ev": 150.0,
+      "search_window_ev": { "min": 145.0, "max": 155.0 },
+      "color": "#F0E442",
+      "category": "general"
+    },
+    {
+      "name": "Al 2s",
+      "element": "Al",
+      "orbital": "2s",
+      "binding_energy_ev": 119.0,
+      "search_window_ev": { "min": 115.0, "max": 125.0 },
+      "color": "#0072B2",
+      "category": "general"
+    },
+    {
+      "name": "S 2p",
+      "element": "S",
+      "orbital": "2p",
+      "binding_energy_ev": 164.0,
+      "search_window_ev": { "min": 160.0, "max": 170.0 },
+      "color": "#D55E00",
+      "category": "general"
+    },
+    {
+      "name": "P 2p",
+      "element": "P",
+      "orbital": "2p",
+      "binding_energy_ev": 133.0,
+      "search_window_ev": { "min": 128.0, "max": 138.0 },
+      "color": "#CC79A7",
+      "category": "general"
+    },
+    {
+      "name": "Ca 2p",
+      "element": "Ca",
+      "orbital": "2p",
+      "binding_energy_ev": 347.0,
+      "search_window_ev": { "min": 342.0, "max": 355.0 },
+      "color": "#E69F00",
+      "category": "general"
+    },
+    {
+      "name": "Na 1s",
+      "element": "Na",
+      "orbital": "1s",
+      "binding_energy_ev": 1071.0,
+      "search_window_ev": { "min": 1065.0, "max": 1078.0 },
+      "color": "#56B4E9",
+      "category": "general"
+    },
+    {
+      "name": "Fe 2p3/2",
+      "element": "Fe",
+      "orbital": "2p3/2",
+      "binding_energy_ev": 707.0,
+      "search_window_ev": { "min": 703.0, "max": 715.0 },
+      "color": "#009E73",
+      "category": "general"
+    },
+    {
+      "name": "Fe 2p1/2",
+      "element": "Fe",
+      "orbital": "2p1/2",
+      "binding_energy_ev": 720.0,
+      "search_window_ev": { "min": 715.0, "max": 730.0 },
+      "color": "#F0E442",
+      "category": "general"
+    }
+  ]
+}

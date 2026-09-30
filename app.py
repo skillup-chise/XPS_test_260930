@@ -4,15 +4,18 @@ XPS（X線光電子分光）データ自動解析 Web アプリ
 Streamlit + Plotly + lmfit を用いて、ブラウザ上で XPS スペクトルの
 読み込み・背景補正・ピーク検出・フィッティング・可視化を行います。
 
-配色ルール:
-  - Okabe-Ito パレット（色覚バリアフリー）を使用
-  - 元素・軌道名ごとに色を固定（ORBITAL_COLORS）し、一貫性を確保
+配色・参照データ:
+  - 元素・軌道の結合エネルギー範囲と色は xps_database.json で一元管理
+  - 新しい元素を追加する場合は JSON を編集するだけで UI / プロットに反映
+  - 色は Okabe-Ito パレット（色覚バリアフリー）を使用
 """
 
 from __future__ import annotations
 
 import io
-from typing import Optional
+import json
+from pathlib import Path
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -23,93 +26,140 @@ from scipy.signal import find_peaks, savgol_filter
 
 
 # ---------------------------------------------------------------------------
-# 定数・参照テーブル
+# 外部データベース（xps_database.json）の読み込み
 # ---------------------------------------------------------------------------
 
-# Okabe-Ito パレット（色盲・色弱でも区別しやすい色セット）
-# 赤と緑の混同を避け、コントラストを確保した配色です。
-OKABE_ITO = {
-    "orange": "#E69F00",
-    "sky_blue": "#56B4E9",
-    "bluish_green": "#009E73",
-    "yellow": "#F0E442",
-    "blue": "#0072B2",
-    "vermillion": "#D55E00",
-    "reddish_purple": "#CC79A7",
-    "black": "#000000",
-    "gray": "#999999",
-}
+# app.py と同じディレクトリにある JSON を参照（デプロイ時も相対パスで解決）
+DATABASE_PATH = Path(__file__).resolve().parent / "xps_database.json"
 
-# グラフ上の役割ごとの固定色（データ曲線・背景・合成曲線など）
-ROLE_COLORS = {
-    "raw": OKABE_ITO["black"],           # 元データ
-    "background": OKABE_ITO["gray"],     # 背景（ベースライン）
-    "corrected": OKABE_ITO["blue"],      # 背景補正後スペクトル
-    "fit_sum": OKABE_ITO["vermillion"],  # 合成フィッティング曲線
-    "peak_marker": OKABE_ITO["orange"],  # 検出ピーク位置マーカー
-}
 
-# 元素・軌道名 → 色コードの 1対1 対応辞書
-# 同じ軌道は常に同じ色で描画され、解釈の一貫性を保ちます。
-ORBITAL_COLORS: dict[str, str] = {
-    "C 1s": OKABE_ITO["orange"],
-    "O 1s": OKABE_ITO["sky_blue"],
-    "N 1s": OKABE_ITO["bluish_green"],
-    "Ti 2p": OKABE_ITO["yellow"],
-    "Ti 2p3/2": OKABE_ITO["yellow"],
-    "Ti 2p1/2": "#B3A000",  # Ti 2p と同系統のやや暗い黄
-    "Si 2p": OKABE_ITO["blue"],
-    "Si 2s": "#4A90A4",
-    "Al 2p": OKABE_ITO["vermillion"],
-    "Al 2s": "#A04500",
-    "Fe 2p": OKABE_ITO["reddish_purple"],
-    "Fe 2p3/2": OKABE_ITO["reddish_purple"],
-    "Fe 2p1/2": "#9B5A7A",
-    "S 2p": "#882255",
-    "Cl 2p": "#44AA99",
-    "Ca 2p": "#117733",
-    "Na 1s": "#332288",
-    "F 1s": "#AA4499",
-    "P 2p": "#661100",
-    "Unknown": OKABE_ITO["gray"],  # 未アサインピーク用
-}
+def _read_xps_database_file(path: Path) -> dict[str, Any]:
+    """
+    JSON ファイルを読み込み、最低限のスキーマ検証を行う（キャッシュなし）。
 
-# 未登録軌道に順次割り当てる予備色（Okabe-Ito を循環使用）
-_FALLBACK_PALETTE = [
-    OKABE_ITO["orange"],
-    OKABE_ITO["sky_blue"],
-    OKABE_ITO["bluish_green"],
-    OKABE_ITO["yellow"],
-    OKABE_ITO["blue"],
-    OKABE_ITO["vermillion"],
-    OKABE_ITO["reddish_purple"],
-]
+    Parameters
+    ----------
+    path : Path
+        xps_database.json のパス。
 
-# 主要元素・軌道の代表的な結合エネルギー（eV）テーブル
-# 文献値の概算であり、化学シフトにより実際の位置は前後します。
-REFERENCE_BINDING_ENERGIES: dict[str, float] = {
-    "Na 1s": 1071.0,
-    "F 1s": 685.0,
-    "O 1s": 531.0,
-    "Ti 2p1/2": 460.0,
-    "Ti 2p3/2": 454.0,
-    "N 1s": 400.0,
-    "Ca 2p": 347.0,
-    "C 1s": 284.8,
-    "Cl 2p": 199.0,
-    "S 2p": 164.0,
-    "Si 2s": 150.0,
-    "P 2p": 133.0,
-    "Al 2s": 119.0,
-    "Si 2p": 99.0,
-    "Al 2p": 73.0,
-    "Fe 2p1/2": 720.0,
-    "Fe 2p3/2": 707.0,
-}
+    Returns
+    -------
+    dict
+        palette / role_colors / orbitals などを含む辞書。
+    """
+    if not path.exists():
+        raise FileNotFoundError(
+            f"XPS データベースが見つかりません: {path}\n"
+            "プロジェクト直下に xps_database.json を配置してください。"
+        )
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
 
-# 軌道アサインの許容誤差（eV）
-# 検出ピーク位置が参照値からこの範囲内なら候補として採用します。
-ASSIGN_TOLERANCE_EV = 5.0
+    if "orbitals" not in data or not isinstance(data["orbitals"], list):
+        raise ValueError("xps_database.json に orbitals 配列が必要です。")
+    for i, orb in enumerate(data["orbitals"]):
+        for key in ("name", "binding_energy_ev", "color", "search_window_ev"):
+            if key not in orb:
+                raise ValueError(f"orbitals[{i}] に必須キー '{key}' がありません。")
+        window = orb["search_window_ev"]
+        if "min" not in window or "max" not in window:
+            raise ValueError(
+                f"orbitals[{i}] ({orb.get('name')}) の search_window_ev に min/max が必要です。"
+            )
+    return data
+
+
+def load_xps_database(path: Path | None = None) -> dict[str, Any]:
+    """
+    XPS 参照データベース（JSON）を読み込む。
+
+    Streamlit は操作のたびにスクリプトを再実行するため、
+    ここでの都度読込により JSON 編集が次の操作で反映されます。
+
+    Parameters
+    ----------
+    path : Path or None
+        JSON パス。省略時は DATABASE_PATH。
+
+    Returns
+    -------
+    dict
+        検証済みデータベース辞書。
+    """
+    return _read_xps_database_file(path or DATABASE_PATH)
+
+
+def build_lookup_tables(db: dict[str, Any]) -> tuple[dict[str, str], dict[str, float], dict[str, dict]]:
+    """
+    JSON データベースからアプリ内で使う辞書を構築する。
+
+    Parameters
+    ----------
+    db : dict
+        load_xps_database の戻り値。
+
+    Returns
+    -------
+    orbital_colors : dict[str, str]
+        軌道名 → HEX カラー。
+    reference_be : dict[str, float]
+        軌道名 → 代表結合エネルギー (eV)。
+    orbital_records : dict[str, dict]
+        軌道名 → 元の軌道レコード（探索ウィンドウ等を含む）。
+    """
+    orbital_colors: dict[str, str] = {}
+    reference_be: dict[str, float] = {}
+    orbital_records: dict[str, dict] = {}
+
+    unknown = db.get("unknown", {"name": "Unknown", "color": "#999999"})
+    unknown_name = unknown.get("name", "Unknown")
+    orbital_colors[unknown_name] = unknown.get("color", "#999999")
+
+    for orb in db["orbitals"]:
+        name = orb["name"]
+        orbital_colors[name] = orb["color"]
+        reference_be[name] = float(orb["binding_energy_ev"])
+        orbital_records[name] = orb
+
+    return orbital_colors, reference_be, orbital_records
+
+
+def refresh_database_globals() -> dict[str, Any]:
+    """
+    xps_database.json を読み直し、モジュールグローバルな参照テーブルを更新する。
+
+    Streamlit は操作のたびにスクリプトを上から再実行するため、
+    この関数をモジュール末尾（または main 先頭）で呼べば JSON 編集が反映されます。
+
+    Returns
+    -------
+    dict
+        読み込んだデータベース。
+    """
+    global XPS_DB, OKABE_ITO, ROLE_COLORS, _FALLBACK_PALETTE
+    global ORBITAL_COLORS, REFERENCE_BINDING_ENERGIES, ORBITAL_RECORDS
+    global ASSIGN_TOLERANCE_EV, UNKNOWN_LABEL
+
+    db = load_xps_database(DATABASE_PATH)
+
+    XPS_DB = db
+    OKABE_ITO = dict(db.get("palette", {}))
+    ROLE_COLORS = dict(db.get("role_colors", {}))
+    _FALLBACK_PALETTE = list(
+        db.get(
+            "fallback_palette",
+            ["#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"],
+        )
+    )
+    ORBITAL_COLORS, REFERENCE_BINDING_ENERGIES, ORBITAL_RECORDS = build_lookup_tables(db)
+    ASSIGN_TOLERANCE_EV = float(db.get("default_assign_tolerance_ev", 5.0))
+    UNKNOWN_LABEL = db.get("unknown", {}).get("name", "Unknown")
+    return db
+
+
+# 起動時（および Streamlit の各 rerun 時）にデータベースを読み込む
+# 元素追加は xps_database.json の編集のみで完結する
+XPS_DB = refresh_database_globals()
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +168,7 @@ ASSIGN_TOLERANCE_EV = 5.0
 
 def get_orbital_color(orbital_name: str, index: int = 0) -> str:
     """
-    軌道名に対応する固定色を返す。
+    軌道名に対応する固定色を返す（xps_database.json の color を参照）。
 
     Parameters
     ----------
@@ -572,31 +622,59 @@ def assign_orbitals(
     tolerance: float = ASSIGN_TOLERANCE_EV,
 ) -> list[str]:
     """
-    検出ピークの結合エネルギーを参照テーブルと照合し、軌道候補をアサインする。
+    検出ピークの結合エネルギーを xps_database.json の参照データと照合し、
+    軌道候補をアサインする。
+
+    判定優先順位:
+      1. ピークが各軌道の search_window_ev（探索ウィンドウ）内にある候補から、
+         代表結合エネルギーに最も近い軌道を選ぶ
+      2. ウィンドウ内に無い場合、代表値との差が tolerance 以下の最近傍を採用
+      3. どちらにも当てはまらなければ Unknown
 
     Parameters
     ----------
     peak_energies : np.ndarray
         検出ピークの結合エネルギー（eV）。
     tolerance : float
-        参照値との許容差（eV）。この範囲内で最も近い軌道を採用。
+        ウィンドウ外ピーク向けのフォールバック許容差（eV）。
+        UI スライダーから渡され、JSON の default_assign_tolerance_ev が初期値。
 
     Returns
     -------
     list[str]
-        各ピークに対応する軌道名（候補なしは "Unknown"）。
+        各ピークに対応する軌道名（候補なしは Unknown）。
     """
     assigned: list[str] = []
-    ref_names = list(REFERENCE_BINDING_ENERGIES.keys())
-    ref_values = np.array([REFERENCE_BINDING_ENERGIES[n] for n in ref_names])
+    orbital_list = list(ORBITAL_RECORDS.values())
 
     for energy in peak_energies:
-        diffs = np.abs(ref_values - energy)
-        best_idx = int(np.argmin(diffs))
-        if diffs[best_idx] <= tolerance:
-            assigned.append(ref_names[best_idx])
+        # --- 1) 探索ウィンドウ内の候補 ---
+        in_window: list[tuple[str, float]] = []
+        for orb in orbital_list:
+            wmin = float(orb["search_window_ev"]["min"])
+            wmax = float(orb["search_window_ev"]["max"])
+            if wmin <= energy <= wmax:
+                be_center = float(orb["binding_energy_ev"])
+                in_window.append((orb["name"], abs(be_center - energy)))
+
+        if in_window:
+            in_window.sort(key=lambda t: t[1])
+            assigned.append(in_window[0][0])
+            continue
+
+        # --- 2) 許容誤差フォールバック ---
+        best_name = UNKNOWN_LABEL
+        best_diff = float("inf")
+        for orb in orbital_list:
+            diff = abs(float(orb["binding_energy_ev"]) - energy)
+            if diff < best_diff:
+                best_diff = diff
+                best_name = orb["name"]
+        if best_diff <= tolerance:
+            assigned.append(best_name)
         else:
-            assigned.append("Unknown")
+            assigned.append(UNKNOWN_LABEL)
+
     return assigned
 
 
@@ -968,7 +1046,10 @@ def main() -> None:
             max_value=15.0,
             value=float(ASSIGN_TOLERANCE_EV),
             step=0.5,
-            help="参照結合エネルギーとの差がこの値以下なら軌道候補として採用。",
+            help=(
+                "探索ウィンドウ外のピーク向けフォールバック。"
+                "通常は xps_database.json の search_window_ev を優先します。"
+            ),
         )
 
         st.subheader("前処理")
@@ -980,14 +1061,19 @@ def main() -> None:
         run_fit = st.checkbox("ピークフィッティングを実行", value=True)
 
         st.markdown("---")
-        with st.expander("配色ルール（Okabe-Ito）"):
+        st.caption(
+            f"参照DB: `{DATABASE_PATH.name}`（軌道 {len(ORBITAL_RECORDS)} 件）"
+        )
+        with st.expander("登録軌道・配色（xps_database.json）"):
             st.markdown(
-                "色覚バリアフリーのため Okabe-Ito パレットを使用し、"
-                "軌道ごとに色を固定しています。"
+                "色覚バリアフリーの Okabe-Ito パレットを使用。"
+                "元素追加は JSON の `orbitals` に追記するだけで反映されます。"
             )
-            # 主要軌道の色見本を表示
+            # JSON に登録された全軌道の色見本（Unknown 以外）
             swatches = ""
-            for name, color in list(ORBITAL_COLORS.items())[:10]:
+            for name, color in ORBITAL_COLORS.items():
+                if name == UNKNOWN_LABEL:
+                    continue
                 swatches += (
                     f'<span style="display:inline-block;width:12px;height:12px;'
                     f'background:{color};margin-right:6px;border:1px solid #333;"></span>'
@@ -1092,22 +1178,29 @@ def main() -> None:
         else:
             st.dataframe(params_df, use_container_width=True, hide_index=True)
 
-    # ----- 参照テーブル・生データ -----
-    with st.expander("参照結合エネルギーテーブル"):
-        ref_df = pd.DataFrame(
-            [
+    # ----- 参照テーブル・生データ（JSON データベース由来） -----
+    with st.expander("参照結合エネルギーテーブル（xps_database.json）"):
+        ref_rows = []
+        for orb in sorted(
+            XPS_DB["orbitals"],
+            key=lambda o: -float(o["binding_energy_ev"]),
+        ):
+            ref_rows.append(
                 {
-                    "軌道": name,
-                    "代表 BE (eV)": be_val,
-                    "色": ORBITAL_COLORS.get(name, ORBITAL_COLORS["Unknown"]),
+                    "軌道": orb["name"],
+                    "代表 BE (eV)": orb["binding_energy_ev"],
+                    "探索ウィンドウ min": orb["search_window_ev"]["min"],
+                    "探索ウィンドウ max": orb["search_window_ev"]["max"],
+                    "色": orb["color"],
+                    "カテゴリ": orb.get("category", ""),
                 }
-                for name, be_val in sorted(
-                    REFERENCE_BINDING_ENERGIES.items(), key=lambda x: -x[1]
-                )
-            ]
-        )
+            )
+        ref_df = pd.DataFrame(ref_rows)
         st.dataframe(ref_df, use_container_width=True, hide_index=True)
-        st.caption("※ 文献概算値です。化学状態により数 eV シフトすることがあります。")
+        st.caption(
+            "※ 文献概算値です。化学状態により数 eV シフトすることがあります。"
+            " 新しい元素は xps_database.json の orbitals に追加してください。"
+        )
 
     with st.expander("読み込みデータ（先頭 20 行）"):
         st.dataframe(df.head(20), use_container_width=True)
