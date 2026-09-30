@@ -137,6 +137,162 @@ def get_orbital_color(orbital_name: str, index: int = 0) -> str:
     return _FALLBACK_PALETTE[index % len(_FALLBACK_PALETTE)]
 
 
+def is_excel_filename(filename: str) -> bool:
+    """
+    ファイル名が Excel（.xlsx / .xls）かどうかを判定する。
+
+    Parameters
+    ----------
+    filename : str
+        アップロードファイル名。
+
+    Returns
+    -------
+    bool
+        Excel ファイルなら True。
+    """
+    name = filename.lower()
+    return name.endswith(".xlsx") or name.endswith(".xls")
+
+
+def excel_engine_for(filename: str) -> str:
+    """
+    拡張子に応じた pandas Excel エンジン名を返す。
+
+    - .xlsx → openpyxl
+    - .xls  → xlrd（xlrd 2.x は旧形式 .xls 専用）
+    """
+    name = filename.lower()
+    if name.endswith(".xlsx"):
+        return "openpyxl"
+    if name.endswith(".xls"):
+        return "xlrd"
+    raise ValueError(f"未対応の Excel 拡張子です: {filename}")
+
+
+def list_excel_sheet_names(uploaded_file) -> list[str]:
+    """
+    Excel ファイル内のシート名一覧を取得する。
+
+    Parameters
+    ----------
+    uploaded_file : UploadedFile
+        Streamlit のアップロードオブジェクト（getvalue でバイト列を取得）。
+
+    Returns
+    -------
+    list[str]
+        シート名のリスト。
+    """
+    engine = excel_engine_for(uploaded_file.name)
+    bio = io.BytesIO(uploaded_file.getvalue())
+    with pd.ExcelFile(bio, engine=engine) as xf:
+        return list(xf.sheet_names)
+
+
+def load_excel_sheet(uploaded_file, sheet_name: str) -> pd.DataFrame:
+    """
+    Excel の指定シートを DataFrame として読み込む（列はそのまま保持）。
+
+    Parameters
+    ----------
+    uploaded_file : UploadedFile
+        アップロードされた Excel ファイル。
+    sheet_name : str
+        読み込むシート名。
+
+    Returns
+    -------
+    pd.DataFrame
+        シートの生データ（ヘッダー行ありとして読み込み）。
+    """
+    engine = excel_engine_for(uploaded_file.name)
+    bio = io.BytesIO(uploaded_file.getvalue())
+    df = pd.read_excel(bio, sheet_name=sheet_name, engine=engine)
+    # 完全に空の列・行を除去して扱いやすくする
+    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
+    if df.empty:
+        raise ValueError(f"シート「{sheet_name}」に有効なデータがありません。")
+    # 列名を文字列に統一（selectbox 表示のため）
+    df.columns = [str(c) for c in df.columns]
+    return df.reset_index(drop=True)
+
+
+def guess_column_name(columns: list[str], keywords: list[str], fallback_index: int = 0) -> str:
+    """
+    列名リストからキーワードに部分一致する列を推定する。
+
+    Parameters
+    ----------
+    columns : list[str]
+        候補となる列名。
+    keywords : list[str]
+        優先して探すキーワード（小文字比較）。例: ["binding", "energy", "結合"]
+    fallback_index : int
+        一致が無い場合に使う列インデックス。
+
+    Returns
+    -------
+    str
+        推定された列名。
+    """
+    lowered = [(c, c.lower()) for c in columns]
+    for kw in keywords:
+        for original, low in lowered:
+            if kw in low:
+                return original
+    if not columns:
+        raise ValueError("選択可能な列がありません。")
+    idx = min(fallback_index, len(columns) - 1)
+    return columns[idx]
+
+
+def build_xps_dataframe_from_columns(
+    raw_df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+) -> pd.DataFrame:
+    """
+    ユーザーが選んだ X/Y 列から解析用 DataFrame を整形する。
+
+    処理内容:
+      1. 指定列を数値型に変換（変換できない値は NaN）
+      2. 欠損値（NaN）を除去
+      3. 列名を ['Binding Energy', 'Intensity'] に正規化
+      4. 結合エネルギー降順でソート（XPS 表示の慣例に合わせる）
+
+    Parameters
+    ----------
+    raw_df : pd.DataFrame
+        Excel などから読み込んだ生テーブル。
+    x_col : str
+        結合エネルギー（X軸）列名。
+    y_col : str
+        強度（Y軸）列名。
+
+    Returns
+    -------
+    pd.DataFrame
+        既存パイプラインに渡せる形式の DataFrame。
+    """
+    if x_col == y_col:
+        raise ValueError("X軸とY軸に同じ列は指定できません。別々の列を選んでください。")
+    if x_col not in raw_df.columns or y_col not in raw_df.columns:
+        raise ValueError("指定された列がデータに存在しません。")
+
+    x = pd.to_numeric(raw_df[x_col], errors="coerce")
+    y = pd.to_numeric(raw_df[y_col], errors="coerce")
+    result = pd.DataFrame({"Binding Energy": x, "Intensity": y})
+    result = result.dropna().sort_values("Binding Energy", ascending=False).reset_index(drop=True)
+
+    if len(result) < 5:
+        raise ValueError(
+            "数値として有効なデータ点が少なすぎます（5点未満）。"
+            "列の選択やシート内容を確認してください。"
+        )
+    return result
+
+
 def load_xps_file(uploaded_file) -> pd.DataFrame:
     """
     アップロードされた CSV / TXT を読み込み、Binding Energy と Intensity 列を返す。
@@ -146,6 +302,8 @@ def load_xps_file(uploaded_file) -> pd.DataFrame:
       - 2列目: Intensity (counts など)
       - ヘッダー有無は自動判定（数値で始まらなければヘッダーありとみなす）
       - 区切りはカンマ・タブ・空白のいずれかに対応
+
+    ※ Excel（.xlsx / .xls）はこの関数ではなく、シート・列選択 UI 経由で読み込みます。
 
     Parameters
     ----------
@@ -157,7 +315,8 @@ def load_xps_file(uploaded_file) -> pd.DataFrame:
     pd.DataFrame
         列名を ['Binding Energy', 'Intensity'] に正規化した DataFrame。
     """
-    raw_bytes = uploaded_file.read()
+    # getvalue() はポインタ位置に依存せず、何度でも同じバイト列を取得できる
+    raw_bytes = uploaded_file.getvalue()
     text = raw_bytes.decode("utf-8", errors="ignore")
 
     # 区切り文字の推定（カンマ → タブ → 空白の順で試行）
@@ -202,6 +361,91 @@ def load_xps_file(uploaded_file) -> pd.DataFrame:
     result.columns = ["Binding Energy", "Intensity"]
     result = result.dropna().sort_values("Binding Energy", ascending=False).reset_index(drop=True)
     return result
+
+
+def load_uploaded_xps_data(uploaded_file) -> Optional[pd.DataFrame]:
+    """
+    アップロードファイルの種類に応じて XPS 用 DataFrame を返す。
+
+    - CSV / TXT: 従来どおり先頭2数値列を自動採用
+    - Excel: シート選択・プレビュー・X/Y列選択の UI を表示し、
+             ユーザー選択に基づいて整形（未確定時は None を返す）
+
+    Parameters
+    ----------
+    uploaded_file : UploadedFile
+        Streamlit のアップロードオブジェクト。
+
+    Returns
+    -------
+    pd.DataFrame or None
+        解析可能な形式。Excel で列未選択などの場合は None（呼び出し側で st.stop）。
+    """
+    filename = uploaded_file.name
+
+    # ----- CSV / TXT: 既存ロジック -----
+    if not is_excel_filename(filename):
+        return load_xps_file(uploaded_file)
+
+    # ----- Excel: シート選択 → プレビュー → 列選択 -----
+    st.subheader("Excel データの読み込み設定")
+
+    sheet_names = list_excel_sheet_names(uploaded_file)
+    if len(sheet_names) == 0:
+        raise ValueError("Excel ファイルにシートが見つかりませんでした。")
+
+    if len(sheet_names) == 1:
+        sheet_name = sheet_names[0]
+        st.caption(f"シート: **{sheet_name}**（1件のみ）")
+    else:
+        sheet_name = st.selectbox(
+            "読み込むシートを選択",
+            options=sheet_names,
+            help="複数シートがある場合、解析対象のシートを選んでください。",
+        )
+
+    raw_df = load_excel_sheet(uploaded_file, sheet_name)
+
+    st.markdown("#### データプレビュー（先頭行）")
+    st.dataframe(raw_df.head(10), use_container_width=True)
+    st.caption(f"シート「{sheet_name}」: {raw_df.shape[0]} 行 × {raw_df.shape[1]} 列")
+
+    columns = list(raw_df.columns)
+    if len(columns) < 2:
+        raise ValueError("Excel シートに列が2つ以上必要です。")
+
+    # 列名から Binding Energy / Intensity らしき列を初期選択
+    default_x = guess_column_name(
+        columns,
+        keywords=["binding energy", "binding", "energy", "結合エネルギー", "結合", "be"],
+        fallback_index=0,
+    )
+    default_y = guess_column_name(
+        columns,
+        keywords=["intensity", "counts", "cps", "強度", "count", "y"],
+        fallback_index=1 if len(columns) > 1 else 0,
+    )
+    # X/Y が同じ列に推定された場合は Y を別列へずらす
+    if default_y == default_x and len(columns) > 1:
+        default_y = columns[1] if columns[0] == default_x else columns[0]
+
+    col_x, col_y = st.columns(2)
+    with col_x:
+        x_col = st.selectbox(
+            "X軸列（結合エネルギー / Binding Energy）",
+            options=columns,
+            index=columns.index(default_x),
+            help="横軸にする列（単位: eV を想定）",
+        )
+    with col_y:
+        y_col = st.selectbox(
+            "Y軸列（強度 / Intensity）",
+            options=columns,
+            index=columns.index(default_y),
+            help="縦軸にする列（counts など）",
+        )
+
+    return build_xps_dataframe_from_columns(raw_df, x_col, y_col)
 
 
 def shirley_background(
@@ -673,7 +917,7 @@ def main() -> None:
 
     st.title("XPS データ自動解析アプリ")
     st.caption(
-        "CSV/TXT の XPS スペクトルを読み込み、背景補正・ピーク検出・"
+        "CSV / Excel（.xlsx, .xls）の XPS スペクトルを読み込み、背景補正・ピーク検出・"
         "軌道アサイン・PseudoVoigt フィッティングを行います。"
         "配色は Okabe-Ito パレット（色覚バリアフリー）を使用し、"
         "元素・軌道ごとに色を固定しています。"
@@ -684,9 +928,12 @@ def main() -> None:
         st.header("解析設定")
 
         uploaded = st.file_uploader(
-            "XPS データファイル（CSV / TXT）",
-            type=["csv", "txt"],
-            help="1列目: Binding Energy (eV), 2列目: Intensity",
+            "XPS データファイル（CSV / Excel）",
+            type=["csv", "xlsx", "xls"],
+            help=(
+                "CSV: 1列目 Binding Energy, 2列目 Intensity。"
+                "Excel: シートと X/Y 列を画面上で選択できます。"
+            ),
         )
         use_sample = st.checkbox("サンプルデータを使う", value=uploaded is None)
 
@@ -751,8 +998,14 @@ def main() -> None:
     # ----- データ読み込み -----
     try:
         if uploaded is not None and not use_sample:
-            df = load_xps_file(uploaded)
-            st.success(f"ファイルを読み込みました: **{uploaded.name}**（{len(df)} 点）")
+            # CSV は従来どおり自動整形、Excel はシート・列選択 UI 付き
+            df = load_uploaded_xps_data(uploaded)
+            if df is None:
+                st.info("解析を続けるには、Excel のシートと X/Y 列を選択してください。")
+                st.stop()
+            st.success(
+                f"ファイルを読み込みました: **{uploaded.name}**（{len(df)} 点）"
+            )
         else:
             df = make_sample_data()
             st.info("サンプルデータ（C 1s / N 1s / O 1s 付近の合成スペクトル）を表示しています。")
