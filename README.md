@@ -5,7 +5,7 @@ CSV / TXT の測定データをブラウザ上で読み込み、背景補正・�
 
 ## 主な機能
 
-1. **ファイル読み込み** — Binding Energy / Intensity の CSV、または Excel（.xlsx / .xls）をアップロード（Excel はシート・列を選択可能）
+1. **ファイル読み込み** — CSV / Excel（.xlsx / .xls）/ Thermo Avantage（.vgd / .vgx）をアップロード（Excel はシート・列選択、VGD/VGX はスペクトル選択）
 2. **背景補正** — Shirley 法または直線近似によるベースライン引算
 3. **ピーク自動検出 & 元素推定** — `scipy.signal.find_peaks` と代表結合エネルギーテーブルによる軌道候補アサイン
 4. **ピークフィッティング** — `lmfit` の PseudoVoigt（ガウス・ローレンツ複合）による複数ピーク分離、位置・FWHM・面積強度の算出
@@ -20,9 +20,9 @@ CSV / TXT の測定データをブラウザ上で読み込み、背景補正・�
 
 ```
 .
-├── app.py              # Streamlit UI および解析・グラフ描画ロジック
+├── app.py              # Streamlit UI および解析・グラフ描画ロジック（VGD/VGX 含む）
 ├── xps_database.json   # 元素・軌道の BE / 探索ウィンドウ / 配色（外部DB）
-├── requirements.txt    # 依存パッケージ
+├── requirements.txt    # 依存パッケージ（openpyxl, xlrd, olefile 含む）
 └── README.md           # 本ドキュメント
 ```
 
@@ -85,6 +85,12 @@ streamlit run app.py
 - 複数シートがある場合は画面上のセレクトボックスでシートを選択
 - 読み込み後にプレビューを表示し、X軸（結合エネルギー）と Y軸（強度）の列をそれぞれ選択
 - 選択列は数値化・欠損除去のうえ解析パイプラインへ渡されます
+
+### Avantage（.vgd / .vgx）
+
+- OLE2 コンパウンドファイルから `VGData` / `VGSpaceAxes` / `VGDataAxes` を `olefile` で解析
+- 運動エネルギー軸と Source Energy から結合エネルギーを算出（`BE = hν − KE`）
+- 複数スペクトル（サーベイ・ナローなど）が含まれる場合はセレクトボックスで選択
 
 XPS 慣例に合わせ、グラフ横軸は結合エネルギーを右→左（高→低）で表示します
 

@@ -14,15 +14,22 @@ from __future__ import annotations
 
 import io
 import json
+import re
+import struct
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import olefile
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from lmfit.models import PseudoVoigtModel, ConstantModel
 from scipy.signal import find_peaks, savgol_filter
+
+# OLE2 ストリーム名に Unicode を許可（Avantage プロパティストリーム用）
+olefile.KEEP_UNICODE_NAMES = True
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +210,24 @@ def is_excel_filename(filename: str) -> bool:
     """
     name = filename.lower()
     return name.endswith(".xlsx") or name.endswith(".xls")
+
+
+def is_avantage_filename(filename: str) -> bool:
+    """
+    Thermo Fisher Avantage 形式（.vgx / .vgd）かどうかを判定する。
+
+    Parameters
+    ----------
+    filename : str
+        アップロードファイル名。
+
+    Returns
+    -------
+    bool
+        Avantage ファイルなら True。
+    """
+    name = filename.lower()
+    return name.endswith(".vgx") or name.endswith(".vgd")
 
 
 def excel_engine_for(filename: str) -> str:
@@ -413,13 +438,559 @@ def load_xps_file(uploaded_file) -> pd.DataFrame:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Thermo Fisher Avantage（.vgd / .vgx）OLE2 パーサ
+# ---------------------------------------------------------------------------
+#
+# Avantage の測定データは Microsoft OLE2 コンパウンドファイルとして保存され、
+# 主に次のストリームを持ちます:
+#   - VGData      : 強度（little-endian float64）
+#   - VGSpaceAxes : エネルギー軸（開始・ステップ・点数など）
+#   - VGDataAxes  : 多次元（複数スペクトル）情報
+#   - プロパティ  : SourceEnergy など測定パラメータ
+# Binding Energy は通常 BE = SourceEnergy - KineticEnergy で算出します。
+# ---------------------------------------------------------------------------
+
+# OLE プロパティストリーム名（Avantage 固有）
+_AVANTAGE_PROP_STREAM = "\x05Q5nw4m3lIjudbfwyAayojlptCa"
+
+# VGSpaceAxes の軸タイプ番号 → 名前
+_SPACE_AXIS_TYPES = {
+    0: "UNDEFINED",
+    1: "ENERGY",
+    2: "ANGLE",
+    3: "X",
+    4: "Y",
+    5: "LEVEL",
+    6: "ETCHLEVEL",
+    10: "POSITION",
+}
+
+# Al Kα / Mg Kα の代表値（SourceEnergy 推定用）
+_DEFAULT_SOURCE_ENERGY_EV = 1486.68
+
+
+@dataclass
+class AvantageSpectrum:
+    """Avantage ファイルから抽出した 1 本の XPS スペクトル。"""
+
+    name: str
+    binding_energy: np.ndarray
+    intensity: np.ndarray
+    kinetic_energy: np.ndarray = field(default_factory=lambda: np.array([]))
+    source_energy: float = _DEFAULT_SOURCE_ENERGY_EV
+    pass_energy: Optional[float] = None
+    num_points: int = 0
+    meta: dict[str, Any] = field(default_factory=dict)
+
+    def to_dataframe(self) -> pd.DataFrame:
+        """解析パイプライン用 DataFrame（Binding Energy / Intensity）へ変換する。"""
+        df = pd.DataFrame(
+            {
+                "Binding Energy": np.asarray(self.binding_energy, dtype=float),
+                "Intensity": np.asarray(self.intensity, dtype=float),
+            }
+        )
+        return df.dropna().sort_values("Binding Energy", ascending=False).reset_index(drop=True)
+
+
+def _read_ole_bstr(buf: io.BytesIO) -> str:
+    """
+    Avantage OLE 内の BSTR（長さ付き UTF-16LE）を読み取る。
+
+    形式: uint32 バイト長 + UTF-16LE 文字列（末尾 null 含むことが多い）
+    """
+    raw_len = buf.read(4)
+    if len(raw_len) < 4:
+        return ""
+    (nbytes,) = struct.unpack("<I", raw_len)
+    data = buf.read(nbytes)
+    if not data or data == b"\x00\x00":
+        return ""
+    try:
+        return data.decode("utf-16-le").rstrip("\x00")
+    except UnicodeDecodeError:
+        return ""
+
+
+def _parse_vg_space_axes(raw: bytes) -> list[dict[str, Any]]:
+    """
+    VGSpaceAxes ストリームを解析し、軸情報のリストを返す。
+
+    線形 ENERGY 軸の場合、start / width(step) / points から
+    運動エネルギー（または結合エネルギー）配列を再構築できます。
+    """
+    buf = io.BytesIO(raw)
+    header = buf.read(8)
+    if len(header) < 8:
+        raise ValueError("VGSpaceAxes が短すぎます。")
+    type_code, num_axis = struct.unpack("<2I", header)
+
+    axes: list[dict[str, Any]] = []
+    for _ in range(num_axis):
+        axis: dict[str, Any] = {
+            "label": _read_ole_bstr(buf),
+            "symbol": _read_ole_bstr(buf),
+            "unit": _read_ole_bstr(buf),
+        }
+        numeric = buf.read(20)
+        if len(numeric) < 20:
+            raise ValueError("VGSpaceAxes の軸数値部が不足しています。")
+        points, start, width = struct.unpack("<Idd", numeric)
+        axis["points"] = int(points)
+        axis["start"] = float(start)
+        axis["width"] = float(width)
+
+        lin_flag = buf.read(1)
+        if len(lin_flag) < 1:
+            raise ValueError("VGSpaceAxes の線形フラグが不足しています。")
+        axis["linear"] = bool(struct.unpack("<b", lin_flag)[0])
+
+        if axis["linear"]:
+            type_raw = buf.read(4)
+            if len(type_raw) < 4:
+                raise ValueError("VGSpaceAxes の軸タイプが不足しています。")
+            (axis_type_id,) = struct.unpack("<I", type_raw)
+            axis["type"] = _SPACE_AXIS_TYPES.get(axis_type_id, f"TYPE_{axis_type_id}")
+            axis["values"] = None
+        else:
+            # 非線形軸: points 個の double + 末尾 4 バイト
+            n = axis["points"]
+            vals_raw = buf.read(8 * n)
+            if len(vals_raw) < 8 * n:
+                raise ValueError("VGSpaceAxes の非線形軸データが不足しています。")
+            axis["values"] = list(struct.unpack(f"<{n}d", vals_raw))
+            buf.read(4)
+            axis["type"] = None
+
+        axes.append(axis)
+
+    # type_code は実装依存のため、解析自体は軸内容を優先する
+    _ = type_code
+    return axes
+
+
+def _parse_vg_data_axes(raw: bytes) -> list[dict[str, int]]:
+    """VGDataAxes ストリームを解析する（複数スペクトル分割に使用）。"""
+    if len(raw) < 8:
+        return []
+    buf = io.BytesIO(raw)
+    _type_code, naxes = struct.unpack("<II", buf.read(8))
+    axes = []
+    for _ in range(naxes):
+        chunk = buf.read(16)
+        if len(chunk) < 16:
+            break
+        start, end, nspace, unknown = struct.unpack("<4I", chunk)
+        axes.append(
+            {
+                "start": int(start),
+                "end": int(end),
+                "nspace": int(nspace),
+                "unknown": int(unknown),
+            }
+        )
+    return axes
+
+
+def _infer_multi_spectrum_shape(
+    total_points: int, data_axes: list[dict[str, int]]
+) -> tuple[int, int]:
+    """
+    全点数と VGDataAxes から (スペクトル数, 1本あたり点数) を推定する。
+
+    Returns
+    -------
+    num_spectra, points_per_spectrum
+    """
+    if total_points <= 0:
+        return 0, 0
+
+    # vgd_reader 互換: data_axes の特定オフセット解釈
+    # end+1 が points / unknown 側がスペクトル数、という経験則
+    if len(data_axes) >= 2:
+        dim1 = data_axes[0]["end"] + 1
+        dim2 = data_axes[1]["end"] + 1
+        if dim1 > 0 and dim2 > 0 and dim1 * dim2 == total_points:
+            # dim2 がスペクトル数、dim1 が点数、とみなす（dim2>1 のとき）
+            if dim2 > 1:
+                return dim2, dim1
+            if dim1 > 1 and total_points % dim1 == 0:
+                return total_points // dim1, dim1
+
+    if len(data_axes) >= 1:
+        pts = data_axes[0]["end"] + 1
+        if pts > 0 and total_points % pts == 0:
+            n_spec = total_points // pts
+            if n_spec >= 1:
+                return n_spec, pts
+
+    return 1, total_points
+
+
+def _extract_source_energy(ole: olefile.OleFileIO) -> float:
+    """
+    OLE プロパティから X 線源エネルギー (eV) を取得する。
+    見つからない場合は Al Kα (1486.68 eV) を返す。
+    """
+    # 1) olefile のプロパティ API
+    for path in (_AVANTAGE_PROP_STREAM, "\x05SummaryInformation"):
+        try:
+            if ole.exists(path):
+                props = ole.getproperties(path, convert_time=True)
+                for key in ("SourceEnergy", "SOURCEENERGY", "source_energy"):
+                    if key in props:
+                        val = float(props[key])
+                        if 100.0 < val < 10000.0:
+                            return val
+                # 値だけ走査
+                for val in props.values():
+                    if isinstance(val, (int, float)) and 1480.0 < float(val) < 1490.0:
+                        return float(val)
+                    if isinstance(val, (int, float)) and 1250.0 < float(val) < 1260.0:
+                        return float(val)
+        except Exception:
+            pass
+
+    # 2) 生バイトから Al/Mg Kα 近傍の float32 を探索
+    try:
+        if ole.exists(_AVANTAGE_PROP_STREAM):
+            raw = ole.openstream(_AVANTAGE_PROP_STREAM).read()
+            for i in range(0, max(0, len(raw) - 4), 4):
+                (val,) = struct.unpack("<f", raw[i : i + 4])
+                if 1480.0 < val < 1490.0 or 1250.0 < val < 1260.0:
+                    return float(val)
+    except Exception:
+        pass
+
+    return _DEFAULT_SOURCE_ENERGY_EV
+
+
+def _extract_pass_energy(ole: olefile.OleFileIO) -> Optional[float]:
+    """プロパティストリームから Pass Energy らしき値を推定する。"""
+    common = {10.0, 20.0, 35.0, 40.0, 50.0, 100.0, 150.0, 160.0, 200.0}
+    try:
+        if not ole.exists(_AVANTAGE_PROP_STREAM):
+            return None
+        raw = ole.openstream(_AVANTAGE_PROP_STREAM).read()
+        for i in range(0, max(0, len(raw) - 4), 4):
+            (val,) = struct.unpack("<f", raw[i : i + 4])
+            if val in common:
+                return float(val)
+    except Exception:
+        return None
+    return None
+
+
+def _energy_axis_from_space(
+    space_axes: list[dict[str, Any]],
+    num_points: int,
+    source_energy: float,
+) -> tuple[np.ndarray, np.ndarray, str]:
+    """
+    VGSpaceAxes から運動エネルギー・結合エネルギーの配列を構築する。
+
+    Returns
+    -------
+    binding_energy, kinetic_energy, axis_mode
+        axis_mode は "ke_to_be" / "already_be" / "fallback"
+    """
+    energy_axis = None
+    for ax in space_axes:
+        label = (ax.get("label") or "").lower()
+        unit = (ax.get("unit") or "").lower()
+        atype = ax.get("type")
+        if atype == "ENERGY" or "energy" in label or unit == "ev":
+            energy_axis = ax
+            break
+    if energy_axis is None and space_axes:
+        energy_axis = space_axes[0]
+
+    if energy_axis is None:
+        # 軸情報が無い場合はダミーの BE インデックス
+        be = np.arange(num_points, dtype=float)[::-1]
+        return be, source_energy - be, "fallback"
+
+    if energy_axis.get("values") is not None:
+        x = np.asarray(energy_axis["values"], dtype=float)
+    else:
+        start = float(energy_axis["start"])
+        step = float(energy_axis["width"])
+        pts = int(energy_axis.get("points") or num_points)
+        x = start + step * np.arange(pts, dtype=float)
+
+    if len(x) != num_points:
+        # 点数不一致時は線形補間で合わせる
+        if len(x) >= 2:
+            x = np.linspace(x[0], x[-1], num_points)
+        else:
+            x = np.arange(num_points, dtype=float)
+
+    label = (energy_axis.get("label") or "").lower()
+    # ラベルが Binding を含む場合は既に BE
+    if "binding" in label or label.startswith("be"):
+        be = x.astype(float)
+        ke = source_energy - be
+        return be, ke, "already_be"
+
+    # 通常 Avantage は Kinetic Energy 軸
+    ke = x.astype(float)
+    be = source_energy - ke
+    return be, ke, "ke_to_be"
+
+
+def _guess_core_level_from_filename(filename: str) -> str:
+    """ファイル名から軌道名らしき文字列を抽出する（例: O1s_Scan.vgd → O1s）。"""
+    base = Path(filename).stem
+    for suffix in (
+        "_Scan", " Scan", "_Region", " Region", "_spectrum", " spectrum",
+        "_core level", " core level",
+    ):
+        if base.lower().endswith(suffix.lower()):
+            base = base[: -len(suffix)]
+            break
+    match = re.match(r"^([A-Z][a-z]?\d+[spdf]\d*)", base)
+    if match:
+        return match.group(1)
+    return base.strip() or "Spectrum"
+
+
+def _find_vgdata_stream_paths(ole: olefile.OleFileIO) -> list[list[str]]:
+    """
+    OLE 内の VGData ストリームパスを列挙する。
+
+    トップレベルだけでなく、ストレージ配下に複数スペクトルが
+    入っている VGX/VGD にも対応します。
+    """
+    paths: list[list[str]] = []
+    for entry in ole.listdir(streams=True, storages=False):
+        if entry and str(entry[-1]).lower() == "vgdata":
+            paths.append(list(entry))
+    # 安定した表示順
+    paths.sort(key=lambda p: "/".join(p).lower())
+    return paths
+
+
+def _sibling_stream(ole: olefile.OleFileIO, vgdata_path: list[str], name: str) -> Optional[bytes]:
+    """VGData と同じ親にある兄弟ストリームを読む。"""
+    sibling = list(vgdata_path[:-1]) + [name]
+    try:
+        if ole.exists(sibling):
+            return ole.openstream(sibling).read()
+    except Exception:
+        return None
+    # トップレベルフォールバック
+    try:
+        if ole.exists(name):
+            return ole.openstream(name).read()
+    except Exception:
+        return None
+    return None
+
+
+def parse_avantage_file(file_bytes: bytes, filename: str = "data.vgd") -> list[AvantageSpectrum]:
+    """
+    .vgd / .vgx（OLE2）バイト列から XPS スペクトル一覧を抽出する。
+
+    Parameters
+    ----------
+    file_bytes : bytes
+        アップロードファイルの生バイト列。
+    filename : str
+        表示名・軌道名推定に使うファイル名。
+
+    Returns
+    -------
+    list[AvantageSpectrum]
+        抽出されたスペクトル（1 本以上）。
+
+    Raises
+    ------
+    ValueError
+        OLE2 でない、または VGData が見つからない場合。
+    """
+    if len(file_bytes) < 8 or data_is_not_ole2(file_bytes):
+        raise ValueError(
+            f"「{filename}」は OLE2 コンパウンドファイルではありません。"
+            " Thermo Fisher Avantage の .vgd / .vgx か確認してください。"
+        )
+
+    try:
+        ole = olefile.OleFileIO(io.BytesIO(file_bytes))
+    except Exception as exc:
+        raise ValueError(f"OLE2 として開けませんでした: {exc}") from exc
+
+    try:
+        vg_paths = _find_vgdata_stream_paths(ole)
+        if not vg_paths:
+            raise ValueError(
+                "VGData ストリームが見つかりません。"
+                " Avantage 形式の .vgd / .vgx か確認してください。"
+            )
+
+        source_energy = _extract_source_energy(ole)
+        pass_energy = _extract_pass_energy(ole)
+        core_guess = _guess_core_level_from_filename(filename)
+
+        # メタデータ（任意）
+        title = ""
+        try:
+            meta = ole.get_metadata()
+            if meta and meta.title:
+                title = str(meta.title).split("\x00")[0]
+        except Exception:
+            pass
+
+        spectra: list[AvantageSpectrum] = []
+
+        for path_i, vg_path in enumerate(vg_paths):
+            raw_data = ole.openstream(vg_path).read()
+            if len(raw_data) < 8:
+                continue
+            # 末尾の端数バイトは切り捨て
+            usable = len(raw_data) - (len(raw_data) % 8)
+            intensities_all = np.frombuffer(raw_data[:usable], dtype="<f8").astype(float)
+            total_points = int(intensities_all.size)
+            if total_points < 2:
+                continue
+
+            space_raw = _sibling_stream(ole, vg_path, "VGSpaceAxes")
+            data_axes_raw = _sibling_stream(ole, vg_path, "VGDataAxes")
+
+            space_axes: list[dict[str, Any]] = []
+            if space_raw:
+                try:
+                    space_axes = _parse_vg_space_axes(space_raw)
+                except Exception:
+                    space_axes = []
+
+            data_axes = _parse_vg_data_axes(data_axes_raw) if data_axes_raw else []
+            num_spectra, points_per = _infer_multi_spectrum_shape(total_points, data_axes)
+            if points_per <= 0 or num_spectra <= 0:
+                num_spectra, points_per = 1, total_points
+
+            # space axis の points を優先
+            if space_axes:
+                ax_pts = int(space_axes[0].get("points") or 0)
+                if ax_pts > 1 and total_points % ax_pts == 0:
+                    points_per = ax_pts
+                    num_spectra = total_points // ax_pts
+
+            parent = "/".join(vg_path[:-1]) if len(vg_path) > 1 else ""
+            block_label = parent or core_guess or f"Block{path_i + 1}"
+
+            for spec_i in range(num_spectra):
+                start = spec_i * points_per
+                end = start + points_per
+                if end > total_points:
+                    break
+                y = intensities_all[start:end]
+                be, ke, mode = _energy_axis_from_space(space_axes, points_per, source_energy)
+
+                if num_spectra == 1 and len(vg_paths) == 1:
+                    name = core_guess
+                elif num_spectra == 1:
+                    name = f"{block_label}"
+                else:
+                    name = f"{block_label} #{spec_i + 1}"
+
+                spectra.append(
+                    AvantageSpectrum(
+                        name=name,
+                        binding_energy=be,
+                        intensity=y,
+                        kinetic_energy=ke,
+                        source_energy=source_energy,
+                        pass_energy=pass_energy,
+                        num_points=points_per,
+                        meta={
+                            "filename": filename,
+                            "ole_path": "/".join(vg_path),
+                            "title": title,
+                            "axis_mode": mode,
+                            "spectrum_index": spec_i,
+                            "total_in_block": num_spectra,
+                            "be_min": float(np.min(be)),
+                            "be_max": float(np.max(be)),
+                        },
+                    )
+                )
+
+        if not spectra:
+            raise ValueError("スペクトル強度を抽出できませんでした。")
+        return spectra
+    finally:
+        try:
+            ole.close()
+        except Exception:
+            pass
+
+
+def data_is_not_ole2(file_bytes: bytes) -> bool:
+    """OLE2 マジックナンバー（D0 CF 11 E0 A1 B1 1A E1）でない場合 True。"""
+    magic = bytes.fromhex("D0CF11E0A1B11AE1")
+    return file_bytes[:8] != magic
+
+
+def load_avantage_via_ui(uploaded_file) -> Optional[pd.DataFrame]:
+    """
+    Avantage（.vgd / .vgx）読み込み UI。
+
+    複数スペクトルがある場合は selectbox で選択し、
+    既存パイプライン用 DataFrame を返す。
+    """
+    st.subheader("Avantage データ（.vgd / .vgx）の読み込み")
+
+    file_bytes = uploaded_file.getvalue()
+    spectra = parse_avantage_file(file_bytes, filename=uploaded_file.name)
+
+    labels = []
+    for i, sp in enumerate(spectra):
+        be_lo, be_hi = float(np.min(sp.binding_energy)), float(np.max(sp.binding_energy))
+        labels.append(
+            f"{i + 1}. {sp.name}  "
+            f"(BE {be_lo:.1f}–{be_hi:.1f} eV, {sp.num_points} pts)"
+        )
+
+    if len(spectra) == 1:
+        idx = 0
+        st.caption(f"スペクトル: **{labels[0]}**（1件のみ）")
+    else:
+        choice = st.selectbox(
+            "解析対象のスペクトルを選択",
+            options=labels,
+            help="サーベイや複数ナローが含まれる場合、解析したい 1 本を選んでください。",
+        )
+        idx = labels.index(choice)
+
+    selected = spectra[idx]
+    df = selected.to_dataframe()
+
+    # プレビューとメタ情報
+    meta_cols = st.columns(3)
+    meta_cols[0].metric("Source Energy", f"{selected.source_energy:.2f} eV")
+    meta_cols[1].metric(
+        "Pass Energy",
+        f"{selected.pass_energy:.1f} eV" if selected.pass_energy else "N/A",
+    )
+    meta_cols[2].metric("データ点数", f"{len(df)}")
+
+    st.markdown("#### スペクトルプレビュー（先頭行）")
+    st.dataframe(df.head(10), use_container_width=True)
+    st.caption(
+        f"軸変換: `{selected.meta.get('axis_mode', '?')}` / "
+        f"OLE: `{selected.meta.get('ole_path', '')}`"
+    )
+    return df
+
+
 def load_uploaded_xps_data(uploaded_file) -> Optional[pd.DataFrame]:
     """
     アップロードファイルの種類に応じて XPS 用 DataFrame を返す。
 
-    - CSV / TXT: 従来どおり先頭2数値列を自動採用
-    - Excel: シート選択・プレビュー・X/Y列選択の UI を表示し、
-             ユーザー選択に基づいて整形（未確定時は None を返す）
+    - CSV: 従来どおり先頭2数値列を自動採用
+    - Excel (.xlsx/.xls): シート選択・プレビュー・X/Y列選択
+    - Avantage (.vgd/.vgx): OLE2 からスペクトル抽出・選択 UI
 
     Parameters
     ----------
@@ -429,73 +1000,75 @@ def load_uploaded_xps_data(uploaded_file) -> Optional[pd.DataFrame]:
     Returns
     -------
     pd.DataFrame or None
-        解析可能な形式。Excel で列未選択などの場合は None（呼び出し側で st.stop）。
+        解析可能な形式。UI 待ちの場合は None（呼び出し側で st.stop）。
     """
     filename = uploaded_file.name
 
-    # ----- CSV / TXT: 既存ロジック -----
-    if not is_excel_filename(filename):
-        return load_xps_file(uploaded_file)
+    # ----- Avantage VGD / VGX -----
+    if is_avantage_filename(filename):
+        return load_avantage_via_ui(uploaded_file)
 
-    # ----- Excel: シート選択 → プレビュー → 列選択 -----
-    st.subheader("Excel データの読み込み設定")
+    # ----- Excel -----
+    if is_excel_filename(filename):
+        st.subheader("Excel データの読み込み設定")
 
-    sheet_names = list_excel_sheet_names(uploaded_file)
-    if len(sheet_names) == 0:
-        raise ValueError("Excel ファイルにシートが見つかりませんでした。")
+        sheet_names = list_excel_sheet_names(uploaded_file)
+        if len(sheet_names) == 0:
+            raise ValueError("Excel ファイルにシートが見つかりませんでした。")
 
-    if len(sheet_names) == 1:
-        sheet_name = sheet_names[0]
-        st.caption(f"シート: **{sheet_name}**（1件のみ）")
-    else:
-        sheet_name = st.selectbox(
-            "読み込むシートを選択",
-            options=sheet_names,
-            help="複数シートがある場合、解析対象のシートを選んでください。",
+        if len(sheet_names) == 1:
+            sheet_name = sheet_names[0]
+            st.caption(f"シート: **{sheet_name}**（1件のみ）")
+        else:
+            sheet_name = st.selectbox(
+                "読み込むシートを選択",
+                options=sheet_names,
+                help="複数シートがある場合、解析対象のシートを選んでください。",
+            )
+
+        raw_df = load_excel_sheet(uploaded_file, sheet_name)
+
+        st.markdown("#### データプレビュー（先頭行）")
+        st.dataframe(raw_df.head(10), use_container_width=True)
+        st.caption(f"シート「{sheet_name}」: {raw_df.shape[0]} 行 × {raw_df.shape[1]} 列")
+
+        columns = list(raw_df.columns)
+        if len(columns) < 2:
+            raise ValueError("Excel シートに列が2つ以上必要です。")
+
+        default_x = guess_column_name(
+            columns,
+            keywords=["binding energy", "binding", "energy", "結合エネルギー", "結合", "be"],
+            fallback_index=0,
         )
-
-    raw_df = load_excel_sheet(uploaded_file, sheet_name)
-
-    st.markdown("#### データプレビュー（先頭行）")
-    st.dataframe(raw_df.head(10), use_container_width=True)
-    st.caption(f"シート「{sheet_name}」: {raw_df.shape[0]} 行 × {raw_df.shape[1]} 列")
-
-    columns = list(raw_df.columns)
-    if len(columns) < 2:
-        raise ValueError("Excel シートに列が2つ以上必要です。")
-
-    # 列名から Binding Energy / Intensity らしき列を初期選択
-    default_x = guess_column_name(
-        columns,
-        keywords=["binding energy", "binding", "energy", "結合エネルギー", "結合", "be"],
-        fallback_index=0,
-    )
-    default_y = guess_column_name(
-        columns,
-        keywords=["intensity", "counts", "cps", "強度", "count", "y"],
-        fallback_index=1 if len(columns) > 1 else 0,
-    )
-    # X/Y が同じ列に推定された場合は Y を別列へずらす
-    if default_y == default_x and len(columns) > 1:
-        default_y = columns[1] if columns[0] == default_x else columns[0]
-
-    col_x, col_y = st.columns(2)
-    with col_x:
-        x_col = st.selectbox(
-            "X軸列（結合エネルギー / Binding Energy）",
-            options=columns,
-            index=columns.index(default_x),
-            help="横軸にする列（単位: eV を想定）",
+        default_y = guess_column_name(
+            columns,
+            keywords=["intensity", "counts", "cps", "強度", "count", "y"],
+            fallback_index=1 if len(columns) > 1 else 0,
         )
-    with col_y:
-        y_col = st.selectbox(
-            "Y軸列（強度 / Intensity）",
-            options=columns,
-            index=columns.index(default_y),
-            help="縦軸にする列（counts など）",
-        )
+        if default_y == default_x and len(columns) > 1:
+            default_y = columns[1] if columns[0] == default_x else columns[0]
 
-    return build_xps_dataframe_from_columns(raw_df, x_col, y_col)
+        col_x, col_y = st.columns(2)
+        with col_x:
+            x_col = st.selectbox(
+                "X軸列（結合エネルギー / Binding Energy）",
+                options=columns,
+                index=columns.index(default_x),
+                help="横軸にする列（単位: eV を想定）",
+            )
+        with col_y:
+            y_col = st.selectbox(
+                "Y軸列（強度 / Intensity）",
+                options=columns,
+                index=columns.index(default_y),
+                help="縦軸にする列（counts など）",
+            )
+
+        return build_xps_dataframe_from_columns(raw_df, x_col, y_col)
+
+    # ----- CSV（およびその他テキスト） -----
+    return load_xps_file(uploaded_file)
 
 
 def shirley_background(
@@ -995,10 +1568,9 @@ def main() -> None:
 
     st.title("XPS データ自動解析アプリ")
     st.caption(
-        "CSV / Excel（.xlsx, .xls）の XPS スペクトルを読み込み、背景補正・ピーク検出・"
-        "軌道アサイン・PseudoVoigt フィッティングを行います。"
-        "配色は Okabe-Ito パレット（色覚バリアフリー）を使用し、"
-        "元素・軌道ごとに色を固定しています。"
+        "CSV / Excel（.xlsx, .xls）/ Avantage（.vgd, .vgx）の XPS スペクトルを読み込み、"
+        "背景補正・ピーク検出・軌道アサイン・PseudoVoigt フィッティングを行います。"
+        "元素・軌道の参照値と配色は xps_database.json（Okabe-Ito）で一元管理しています。"
     )
 
     # ----- サイドバー: 解析パラメータ -----
@@ -1006,11 +1578,12 @@ def main() -> None:
         st.header("解析設定")
 
         uploaded = st.file_uploader(
-            "XPS データファイル（CSV / Excel）",
-            type=["csv", "xlsx", "xls"],
+            "XPS データファイル（CSV / Excel / VGD / VGX）",
+            type=["csv", "xlsx", "xls", "vgx", "vgd"],
             help=(
                 "CSV: 1列目 Binding Energy, 2列目 Intensity。"
-                "Excel: シートと X/Y 列を画面上で選択できます。"
+                "Excel: シートと X/Y 列を選択。"
+                "VGD/VGX: Thermo Avantage の OLE2 形式からスペクトルを抽出。"
             ),
         )
         use_sample = st.checkbox("サンプルデータを使う", value=uploaded is None)
